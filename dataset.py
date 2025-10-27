@@ -8,6 +8,7 @@ from config import CFG
 class SchedulingNPZDataset(Dataset):
     """从 npz 加载 [N, 128, 3, 2] -> 每样本返回 (features [128, 6], label int)。
     添加特征归一化以提高训练稳定性。
+    支持两种标签模式：'user' (0-127) 或 'combined' (0-383)。
     """
     def __init__(self, npz_path: str, normalize=True):
         super().__init__()
@@ -15,6 +16,16 @@ class SchedulingNPZDataset(Dataset):
         self.X = data["X"]        # [N, 128, 3, 2]
         self.y = data["y"]        # [N]
         self.normalize = normalize
+        
+        # 读取标签模式（如果存在）
+        if "meta" in data:
+            meta = data["meta"].item()
+            self.label_mode = meta.get("label_mode", "user")
+            self.num_classes = CFG.N_USERS * 3 if self.label_mode == "combined" else CFG.N_USERS
+        else:
+            # 向后兼容：旧数据集默认为 user 模式
+            self.label_mode = "user"
+            self.num_classes = CFG.N_USERS
         
         # 计算归一化参数（基于整个数据集）
         if self.normalize:

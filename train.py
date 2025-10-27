@@ -128,6 +128,9 @@ def main():
 
     # 数据
     full = SchedulingNPZDataset(args.data)
+    num_classes = full.num_classes
+    label_mode = full.label_mode
+    print(f"数据集标签模式: {label_mode}, 类别数: {num_classes}")
     
     # 过拟合测试模式：只用前2048样本
     if args.overfit_test:
@@ -144,7 +147,8 @@ def main():
                            num_workers=args.num_workers, pin_memory=True if args.num_workers > 0 else False)
 
     # 模型
-    model = build_model(args.model, input_dim=6).to(device)
+    model = build_model(args.model, input_dim=6, num_classes=num_classes).to(device)
+    print(f"模型: {args.model}, 输入维度: 6, 输出类别数: {num_classes}")
     
     # 初始化模型权重
     def init_weights(m):
@@ -179,7 +183,7 @@ def main():
             os.makedirs(os.path.dirname(args.save), exist_ok=True)
             torch.save(dict(
                 model=args.model, state_dict=model.state_dict(),
-                cfg=dict(N_USERS=CFG.N_USERS)
+                cfg=dict(N_USERS=CFG.N_USERS, num_classes=num_classes, label_mode=label_mode)
             ), args.save)
             tqdm.write(f"  -> 保存最佳模型到: {args.save} (val_acc={best_acc:.4f})")
 

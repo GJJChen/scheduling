@@ -40,13 +40,16 @@ def test_model_forward():
     print("=" * 60)
     
     ds = SchedulingNPZDataset("data/train.npz", normalize=True)
+    num_classes = ds.num_classes
+    print(f"数据集类别数: {num_classes}")
+    
     batch_x = torch.stack([ds[i][0] for i in range(32)])  # [32, 128, 6]
     
     models = ["bilstm", "mlp", "transformer"]
     
     for model_name in models:
         print(f"\n测试模型: {model_name}")
-        model = build_model(model_name, input_dim=6)
+        model = build_model(model_name, input_dim=6, num_classes=num_classes)
         model.eval()
         
         with torch.no_grad():
@@ -70,6 +73,8 @@ def test_gradient_flow():
     print("=" * 60)
     
     ds = SchedulingNPZDataset("data/train.npz", normalize=True)
+    num_classes = ds.num_classes
+    
     batch_x = torch.stack([ds[i][0] for i in range(32)])
     batch_y = torch.tensor([ds[i][1] for i in range(32)])
     
@@ -77,7 +82,7 @@ def test_gradient_flow():
     
     for model_name in models:
         print(f"\n测试模型: {model_name}")
-        model = build_model(model_name, input_dim=6)
+        model = build_model(model_name, input_dim=6, num_classes=num_classes)
         model.train()
         
         # 前向传播
