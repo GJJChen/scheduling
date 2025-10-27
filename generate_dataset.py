@@ -51,7 +51,7 @@ def generate_batch(args_tuple):
             continue
         
         X_batch.append(snap)
-        y_batch.append(u)
+        y_batch.append(u * len(CFG.SERVICES) + s)
         
         # 统计负面事件
         for k, v in neg.items():
@@ -113,7 +113,7 @@ def main():
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     np.savez_compressed(args.out, X=X, y=y, meta=dict(
         services=CFG.SERVICES, attrs=CFG.ATTRS, n_users=CFG.N_USERS,
-        neg_stats=neg_stats
+        neg_stats=neg_stats, label_mode="combined"
     ))
     print(f"Saved: {args.out}")
     print("Neg events (sum over dataset):", neg_stats)

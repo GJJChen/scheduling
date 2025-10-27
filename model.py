@@ -1,54 +1,45 @@
-
 # -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 from config import CFG
 
 class BiLSTMClassifier(nn.Module):
-    """按"用户维度"作为序列建模，输出每个用户的打分，softmax 做用户分类。
-    支持两种模式：
+    """支持两种模式：
     - num_classes=128: 只预测用户
     - num_classes=384: 预测用户×业务组合
     """
-    def __init__(self, input_dim=6, hidden=128, layers=2, dropout=0.1, num_classes=128):
+    def __init__(self, input_dim=6, hidden_size=128, num_layers=2, dropout=0.1, num_classes=128):
         super().__init__()
         self.num_classes = num_classes
-        # 添加输入归一化层
-        self.norm = nn.LayerNorm(input_dim)
-        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden, num_layers=layers,
-                            batch_first=True, dropout=dropout if layers > 1 else 0.0,
-                            bidirectional=True)
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=True,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
         
-        if num_classes == 128:
-            # 原始模式：每个用户输出一个分数
-            self.head = nn.Sequential(
-                nn.LayerNorm(hidden*2),
-                nn.Linear(hidden*2, hidden),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden, 1)
-            )
+        # *** 关键修复：改变分类头结构 ***
+        if num_classes == CFG.N_USERS:
+            # User模式: 每个用户输出一个logit
+            self.head = nn.Linear(hidden_size * 2, 1)
         else:
-            # Combined模式：展平后输出所有类别
-            self.head = nn.Sequential(
-                nn.LayerNorm(hidden*2*128),  # 展平后的维度
-                nn.Linear(hidden*2*128, hidden*4),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden*4, num_classes)
-            )
+            # Combined模式: 每个用户输出3个业务的logit
+            self.head = nn.Linear(hidden_size * 2, 3)
 
-    def forward(self, x):  # x: [B, 128, 6]
-        B = x.size(0)
-        x = self.norm(x)             # 输入归一化
-        h, _ = self.lstm(x)          # [B, 128, 2H]
+    def forward(self, x):
+        # x: [B, 128, 6]
+        x, _ = self.lstm(x)  # [B, 128, hidden*2]
         
-        if self.num_classes == 128:
-            logits = self.head(h).squeeze(-1)  # [B, 128]
+        if self.num_classes == CFG.N_USERS:
+            # -> [B, 128, 1] -> [B, 128]
+            return self.head(x).squeeze(-1)
         else:
-            h_flat = h.reshape(B, -1)  # [B, 128*2H]
-            logits = self.head(h_flat)  # [B, num_classes]
-        return logits
+            # -> [B, 128, 3] -> [B, 384]
+            x = self.head(x)
+            return x.reshape(x.size(0), -1)
+
 
 class MLPClassifier(nn.Module):
     """支持两种模式：
@@ -119,37 +110,60 @@ class TransformerClassifier(nn.Module):
                                                    norm_first=True)  # Pre-LN更稳定
         self.enc = nn.TransformerEncoder(encoder_layer, num_layers=layers)
         
-        if num_classes == 128:
+        # *** 关键修复：改变分类头结构 ***
+        if num_classes == CFG.N_USERS:
+            # User模式: 每个用户输出一个logit
             self.head = nn.Sequential(
                 nn.LayerNorm(d_model),
-                nn.Linear(d_model, d_model // 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_model // 2, 1)
+                nn.Linear(d_model, 1)
             )
         else:
-            # Combined模式：展平后输出所有类别
+            # Combined模式: 每个用户输出3个业务的logit
             self.head = nn.Sequential(
-                nn.LayerNorm(d_model * 128),
-                nn.Linear(d_model * 128, d_model * 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(d_model * 2, num_classes)
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, 3)
             )
 
-    def forward(self, x):  # [B, 128, 6]
-        B = x.size(0)
-        x = self.inp_norm(x)      # 输入归一化
-        h = self.inp(x)           # [B, 128, d_model]
-        h = h + self.pos_emb      # *** 添加位置编码 ***
-        h = self.enc(h)           # [B, 128, d_model]
+    def forward(self, x):
+        # x: [B, 128, 6]
+        x = self.inp_norm(x)
+        x = self.inp(x)
+        x = x + self.pos_emb  # 加上位置编码
         
-        if self.num_classes == 128:
-            logits = self.head(h).squeeze(-1)  # [B, 128]
+        x = self.enc(x)  # [B, 128, d_model]
+        
+        if self.num_classes == CFG.N_USERS:
+            # -> [B, 128, 1] -> [B, 128]
+            return self.head(x).squeeze(-1)
         else:
-            h_flat = h.reshape(B, -1)  # [B, 128*d_model]
-            logits = self.head(h_flat)  # [B, num_classes]
-        return logits
+            # -> [B, 128, 3] -> [B, 384]
+            x = self.head(x)
+            return x.reshape(x.size(0), -1)
+
+class HierTransformer(nn.Module):
+    def __init__(self, input_dim=6, d_model=128, nhead=8, layers=2, dim_feedforward=256, dropout=0.1):
+        super().__init__()
+        self.inp_norm = nn.LayerNorm(input_dim)
+        self.inp = nn.Linear(input_dim, d_model)
+        self.pos_emb = nn.Parameter(torch.randn(1, CFG.N_USERS, d_model) * 0.02)
+        enc_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout,
+                                               batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        # 全局汇聚一个 token 用于 service 预测（或用 mean-pool 亦可）
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.service_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 3))
+        self.user_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 1))  # 每用户1个logit
+
+    def forward(self, x):  # x: [B, 128, 6]
+        x = self.inp_norm(x); x = self.inp(x); x = x + self.pos_emb
+        h = self.enc(x)  # [B, 128, d]
+        # service logits
+        g = self.pool(h.transpose(1,2)).squeeze(-1)  # [B, d]
+        service_logits = self.service_head(g)        # [B, 3]
+        # user logits（对所有用户给出一个分数，训练时只监督真值 service 下的 argmax 用户）
+        user_logits = self.user_head(h).squeeze(-1)  # [B, 128]
+        return service_logits, user_logits
+
 
 def build_model(name: str, input_dim=6, num_classes=128):
     """构建模型
