@@ -1,24 +1,102 @@
 # -*- coding: utf-8 -*-
-import argparse, os
+import argparse, os, json
 from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score
-from tqdm import tqdm  # noqa: F401
+from tqdm import tqdm
 
-from config import CFG
 from dataset import SchedulingNPZDataset, split_dataset
 from model import build_model
-from rules import schedule_one
+
+
+
+class EarlyStopping:
+    """早停"""
+    def __init__(self, patience=10, min_delta=0.0, mode='max'):
+        """
+        Args:
+            patience: 忍耐多少个epoch性能不提升，超过之后停止训练
+            min_delta: 最小改进阈值，改进小于该值不计入提升
+            mode: “max” 表示指标越大越好（如accuracy），“min” 表示越小越好（如loss）
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode
+        self.counter = 0
+        self.best_value = None
+        self.early_stop = False
+        
+    def __call__(self, current_value):
+        if self.best_value is None:
+            self.best_value = current_value
+            return False
+        
+        if self.mode == 'max':
+            improved = current_value > self.best_value + self.min_delta
+        else:
+            improved = current_value < self.best_value - self.min_delta
+        
+        if improved:
+            self.best_value = current_value
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+        
+        return False
+
+
+class TrainingHistory:
+    """记录训练历史"""
+    def __init__(self, model_name, save_dir="results"):
+        self.model_name = model_name
+        self.save_dir = save_dir
+        self.history = {
+            'model': model_name,
+            'epochs': [],
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': [],
+            'val_top5': [],
+            'val_top10': [],
+            'learning_rate': []
+        }
+        os.makedirs(save_dir, exist_ok=True)
+        
+    def add_epoch(self, epoch, train_loss, train_acc, val_loss, val_acc, val_top5, val_top10, lr):
+        """添加一个epoch的记录"""
+        self.history['epochs'].append(epoch)
+        self.history['train_loss'].append(float(train_loss))
+        self.history['train_acc'].append(float(train_acc))
+        self.history['val_loss'].append(float(val_loss))
+        self.history['val_acc'].append(float(val_acc))
+        self.history['val_top5'].append(float(val_top5))
+        self.history['val_top10'].append(float(val_top10))
+        self.history['learning_rate'].append(float(lr))
+    
+    def save(self):
+        """存到JSON"""
+        save_path = os.path.join(self.save_dir, f"{self.model_name}_history.json")
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(self.history, f, indent=2, ensure_ascii=False)
+        print(f"训练历史已保存到: {save_path}")
+        return save_path
+
 
 def set_seed(seed: int = 2025):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-def train_one_epoch(model, loader, optim, scheduler, device, epoch=None, is_hierarchical=False):
+def train_one_epoch(model, loader, optim, scheduler, device, epoch=None,
+                    amp_enabled=False, scaler: Optional[torch.cuda.amp.GradScaler] = None,
+                    non_blocking: bool = False):
     model.train()
     crit = nn.CrossEntropyLoss()
     losses = []
@@ -27,67 +105,47 @@ def train_one_epoch(model, loader, optim, scheduler, device, epoch=None, is_hier
     total = 0
     pbar = tqdm(loader, desc=f"Train Ep{epoch}" if epoch is not None else "Train")
     for feats, label in pbar:
-        feats = feats.to(device)          # [B, 128, 6]
-        label = label.to(device)          # [B]
+        feats = feats.to(device, non_blocking=non_blocking)          # [B, 128, 6]
+        label = label.to(device, non_blocking=non_blocking)          # [B]
         
-        # 检查输入是否有 NaN
+        # 检查输入是否有 NaN 的值
         if torch.isnan(feats).any() or torch.isinf(feats).any():
-            print(f"Warning: NaN or Inf in input features")
+            print(f"警告: 存在NaN 或 Inf")
             continue
         
         optim.zero_grad()
         
-        if is_hierarchical:
-            # HierTransformer: 返回 (service_logits, user_logits)
-            service_logits, user_logits = model(feats)  # [B, 3], [B, 128]
-            
-            # 检查输出是否有 NaN
-            if torch.isnan(service_logits).any() or torch.isinf(service_logits).any() or \
-               torch.isnan(user_logits).any() or torch.isinf(user_logits).any():
-                print(f"Warning: NaN or Inf in logits")
-                continue
-            
-            # 从 label 中解析 service 和 user
-            # label 格式: user * 3 + service (combined mode)
-            service_tgt = label % 3
-            user_tgt = label // 3
-            
-            # 分层损失
-            loss_service = crit(service_logits, service_tgt)
-            loss_user = crit(user_logits, user_tgt)
-            loss = loss_service + loss_user
-            
-            # 预测：先预测 service，再预测该 service 下的 user
-            pred_service = torch.argmax(service_logits, dim=1)
-            pred_user = torch.argmax(user_logits, dim=1)
-            pred = pred_user * 3 + pred_service  # 组合预测
-            
-        else:
-            # 普通模型：单一输出
+        # 前向传播过程
+        with torch.amp.autocast('cuda', enabled=amp_enabled):
             logits = model(feats)             # [B, num_classes]
-            
-            # 检查输出是否有 NaN
+
             if torch.isnan(logits).any() or torch.isinf(logits).any():
-                print(f"Warning: NaN or Inf in logits")
+                print(f"警告: 在输出中检测到 NaN 或 Inf")
                 continue
-            
+
             loss = crit(logits, label)
             pred = torch.argmax(logits, dim=1)
         
         # 检查 loss 是否有效
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: NaN or Inf loss detected, skipping batch")
+            print(f"警告: 检测到NaN or Inf 损失")
             continue
         
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optim.step()
+        if amp_enabled and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optim)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optim)
+            scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optim.step()
 
         losses.append(loss.item())
         all_pred.append(pred.detach().cpu().numpy())
         all_tgt.append(label.detach().cpu().numpy())
 
-        # running accuracy for progress bar
         correct += (pred == label).sum().item()
         total += label.size(0)
         running_acc = correct / total if total > 0 else 0.0
@@ -102,7 +160,8 @@ def train_one_epoch(model, loader, optim, scheduler, device, epoch=None, is_hier
     return float(np.mean(losses)) if losses else float('inf'), float(acc)
 
 @torch.no_grad()
-def evaluate(model, loader, device, epoch=None, is_hierarchical=False):
+def evaluate(model, loader, device, epoch=None, amp_enabled=False,
+             non_blocking: bool = False):
     model.eval()
     crit = nn.CrossEntropyLoss()
     losses = []
@@ -112,38 +171,10 @@ def evaluate(model, loader, device, epoch=None, is_hierarchical=False):
     total = 0
     pbar = tqdm(loader, desc=f"Val Ep{epoch}" if epoch is not None else "Val", leave=False)
     for feats, label in pbar:
-        feats = feats.to(device)
-        label = label.to(device)
+        feats = feats.to(device, non_blocking=non_blocking)
+        label = label.to(device, non_blocking=non_blocking)
         
-        if is_hierarchical:
-            # HierTransformer: 返回 (service_logits, user_logits)
-            service_logits, user_logits = model(feats)  # [B, 3], [B, 128]
-            
-            # 从 label 中解析 service 和 user
-            service_tgt = label % 3
-            user_tgt = label // 3
-            
-            # 分层损失
-            loss_service = crit(service_logits, service_tgt)
-            loss_user = crit(user_logits, user_tgt)
-            loss = loss_service + loss_user
-            
-            # 预测：先预测 service，再预测该 service 下的 user
-            pred_service = torch.argmax(service_logits, dim=1)
-            pred_user = torch.argmax(user_logits, dim=1)
-            pred = pred_user * 3 + pred_service  # 组合预测
-            
-            # 构建组合 logits 用于 top-k 计算
-            # 对于每个 service，使用对应的 user_logits
-            B = feats.size(0)
-            combined_logits = torch.zeros(B, 384, device=device)  # [B, 128*3]
-            for s in range(3):
-                combined_logits[:, s::3] = user_logits.unsqueeze(-1).expand(-1, -1, 1).squeeze(-1) + \
-                                           service_logits[:, s:s+1] * 0.1  # 添加 service 信息
-            logits = combined_logits
-            
-        else:
-            # 普通模型：单一输出
+        with torch.amp.autocast('cuda', enabled=amp_enabled):
             logits = model(feats)
             loss = crit(logits, label)
             pred = torch.argmax(logits, dim=1)
@@ -170,112 +201,73 @@ def evaluate(model, loader, device, epoch=None, is_hierarchical=False):
     acc = accuracy_score(all_tgt, all_pred)
     return float(np.mean(losses)), float(acc), float(top5_acc), float(top10_acc)
 
-
-def check_dataset_labels(npz_path: str, sample_limit: Optional[int] = None) -> float:
-    data = np.load(npz_path, allow_pickle=True)
-    X = data["X"]
-    y = data["y"].astype(np.int64)
-
-    total = X.shape[0]
-    if sample_limit is not None:
-        total = min(total, sample_limit)
-
-    meta = data["meta"].item() if "meta" in data else {}
-    label_mode = meta.get("label_mode", "user")
-    num_services = len(meta.get("services", CFG.SERVICES))
-
-    correct = 0
-    missing = 0
-    mismatches = []
-
-    for idx in range(total):
-        snap = X[idx]
-        u, s, _ = schedule_one(snap)
-
-        if u is None or s is None:
-            missing += 1
-            continue
-
-        if label_mode == "combined":
-            rule_label = u * num_services + s
-        else:
-            rule_label = u
-
-        dataset_label = int(y[idx])
-        if rule_label == dataset_label:
-            correct += 1
-        elif len(mismatches) < 5:
-            mismatches.append((idx, rule_label, dataset_label, int(u), int(s)))
-
-    effective = total - missing
-    accuracy = correct / effective if effective > 0 else 0.0
-
-    print("=== 规则标签一致性检查 ===")
-    print(f"检查样本: {total}")
-    if missing:
-        print(f"跳过样本: {missing} (schedule_one 返回 None)")
-    print(f"标签准确率: {accuracy:.4f}")
-    if mismatches:
-        print("注意: 发现标签与规则不一致的样本 (最多5条):")
-        for idx, rule_label, dataset_label, user_idx, service_idx in mismatches:
-            print(f"  idx={idx} rule={rule_label} dataset={dataset_label} (user={user_idx}, service={service_idx})")
-
-    return accuracy
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="data/train.npz", help="npz 数据集路径")
     ap.add_argument("--model", type=str, default="bilstm", choices=["bilstm", "mlp", "transformer", "hier"])
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch-size", type=int, default=256)  # 降低batch size提升稳定性
-    ap.add_argument("--lr", type=float, default=1e-3)  # 进一步降低学习率
+    ap.add_argument("--epochs", type=int, default=10)
+    ap.add_argument("--batch-size", type=int, default=2048)  # 降低batch size提升稳定性
+    ap.add_argument("--lr", type=float, default=1e-2)  # 进一步降低学习率
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=2025)
     ap.add_argument("--save", type=str, default="checkpoints/best.pt")
-    ap.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (Windows建议0)")
-    ap.add_argument("--overfit-test", action="store_true", help="小数据集过拟合测试模式")
-    ap.add_argument("--label-check-samples", type=int, default=None,
-                    help="预先校验标签时最多检查的样本数（默认全部）")
-    ap.add_argument("--skip-label-check", action="store_true", help="跳过规则标签准确性校验")
+    ap.add_argument("--num-workers", type=int, default=8, help="DataLoader workers (Windows建议0)")
+    ap.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader 预取因子(>0且num_workers>0生效)")
+    ap.add_argument("--persistent-workers", action="store_true", help="开启持久化workers以减少反复fork开销")
+    # 早停相关参数
+    ap.add_argument("--patience", type=int, default=15, help="早停忍耐多少个epoch不提升就停止")
+    ap.add_argument("--min-delta", type=float, default=0.0001, help="早停最小改进阈值")
+    ap.add_argument("--no-early-stop", action="store_true", help="禁用早停")
+    # AMP/TF32 加速
+    ap.add_argument("--amp", dest="amp", action="store_true", help="启用混合精度训练(默认CUDA上开启)")
+    ap.add_argument("--no-amp", dest="amp", action="store_false", help="禁用混合精度训练")
+    ap.set_defaults(amp=None)
+    ap.add_argument("--allow-tf32", dest="tf32", action="store_true", help="允许TF32(需Ampere+显卡)")
+    ap.add_argument("--no-tf32", dest="tf32", action="store_false", help="禁用TF32")
+    ap.set_defaults(tf32=None)
+    # 训练历史保存
+    ap.add_argument("--results-dir", type=str, default="results", help="训练历史保存目录")
     args = ap.parse_args()
 
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if not args.skip_label_check:
-        check_dataset_labels(args.data, sample_limit=args.label_check_samples)
+    # 默认在CUDA上开启AMP/TF32
+    if args.amp is None:
+        args.amp = (device == "cuda")
+    if args.tf32 is None:
+        args.tf32 = (device == "cuda")
+    if device == "cuda":
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
+        except Exception:
+            pass
+        # 对部分算子提升速度
+        try:
+            torch.set_float32_matmul_precision("medium")
+        except Exception:
+            pass
 
     # 数据
-    full = SchedulingNPZDataset(args.data)
+    full = SchedulingNPZDataset(args.data, normalize=True, precompute=True)
     num_classes = full.num_classes
     label_mode = full.label_mode
-    print(f"数据集标签模式: {label_mode}, 类别数: {num_classes}")
-    
-    # 过拟合测试模式：只用前2048样本
-    if args.overfit_test:
-        print("*** 过拟合测试模式：使用前2048样本 ***")
-        from torch.utils.data import Subset
-        indices = list(range(min(2048, len(full))))
-        full = Subset(full, indices)
-        args.val_ratio = 0.2  # 测试模式用更多验证集
+    n_users = full.n_users
+    print(f"数据集标签模式: {label_mode}, 类别数: {num_classes}, 用户数: {n_users}")
     
     train_ds, val_ds = split_dataset(full, val_ratio=args.val_ratio, seed=args.seed)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, 
-                             num_workers=args.num_workers, pin_memory=True if args.num_workers > 0 else False)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, 
-                           num_workers=args.num_workers, pin_memory=True if args.num_workers > 0 else False)
 
-    # 判断是否使用分层模型
-    is_hierarchical = (args.model == "hier")
-    
-    # 模型
-    if is_hierarchical:
-        from model import HierTransformer
-        model = HierTransformer(input_dim=6).to(device)
-        print(f"模型: HierTransformer (分层输出), 输入维度: 6")
-    else:
-        model = build_model(args.model, input_dim=6, num_classes=num_classes).to(device)
-        print(f"模型: {args.model}, 输入维度: 6, 输出类别数: {num_classes}")
+    dl_common = dict(num_workers=args.num_workers)
+    if device == "cuda":
+        dl_common["pin_memory"] = True
+    if args.num_workers > 0:
+        if args.prefetch_factor and args.prefetch_factor > 0:
+            dl_common["prefetch_factor"] = args.prefetch_factor
+        dl_common["persistent_workers"] = bool(args.persistent_workers)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **dl_common)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **dl_common)
+
+    model = build_model(args.model, input_dim=6, num_classes=num_classes, n_users=n_users).to(device)
+    print(f"模型: {args.model}, 输入维度: 6, 输出类别数: {num_classes}, 用户数: {n_users}")
     
     # 初始化模型权重
     def init_weights(m):
@@ -299,24 +291,65 @@ def main():
     # 添加学习率调度器
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs, eta_min=args.lr*0.01)
 
+    # 初始化早停和训练历史记录
+    early_stopping = None if args.no_early_stop else EarlyStopping(
+        patience=args.patience, 
+        min_delta=args.min_delta, 
+        mode='max'
+    )
+    
+    history = TrainingHistory(
+        model_name=f"{args.model}_{label_mode}",
+        save_dir=args.results_dir
+    )
+
     best_acc = -1.0
+    scaler = torch.amp.GradScaler('cuda',enabled=args.amp) if device == "cuda" else None
+    non_blocking = (device == "cuda")
+    epoch = 0
     for epoch in range(1, args.epochs+1):
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, optim, scheduler, device, 
-                                          epoch=epoch, is_hierarchical=is_hierarchical)
-        va_loss, va_acc, va_top5, va_top10 = evaluate(model, val_loader, device, 
-                                                       epoch=epoch, is_hierarchical=is_hierarchical)
+        tr_loss, tr_acc = train_one_epoch(
+            model, train_loader, optim, scheduler, device,
+            epoch=epoch,
+            amp_enabled=bool(args.amp), scaler=scaler, non_blocking=non_blocking
+        )
+        va_loss, va_acc, va_top5, va_top10 = evaluate(
+            model, val_loader, device, epoch=epoch,
+            amp_enabled=bool(args.amp), non_blocking=non_blocking
+        )
         current_lr = optim.param_groups[0]['lr']
+        
+        # 记录训练历史
+        history.add_epoch(epoch, tr_loss, tr_acc, va_loss, va_acc, va_top5, va_top10, current_lr)
+        
         tqdm.write(f"[Epoch {epoch:02d}] Train loss={tr_loss:.4f} acc={tr_acc:.4f} | Val loss={va_loss:.4f} acc={va_acc:.4f} top5={va_top5:.4f} top10={va_top10:.4f} | LR={current_lr:.6f}")
+        
+        # 保存最佳模型
         if va_acc > best_acc:
             best_acc = va_acc
             os.makedirs(os.path.dirname(args.save), exist_ok=True)
             torch.save(dict(
                 model=args.model, state_dict=model.state_dict(),
-                cfg=dict(N_USERS=CFG.N_USERS, num_classes=num_classes, label_mode=label_mode)
+                cfg=dict(n_users=n_users, num_classes=num_classes, label_mode=label_mode),
+                best_epoch=epoch,
+                best_val_acc=best_acc
             ), args.save)
             tqdm.write(f"  -> 保存最佳模型到: {args.save} (val_acc={best_acc:.4f})")
+        
+        # 早停检查
+        if early_stopping is not None:
+            if early_stopping(va_acc):
+                tqdm.write(f"早停,验证准确率在 {early_stopping.patience} 个epoch内未提升")
+                tqdm.write(f"最佳验证准确率: {early_stopping.best_value:.4f}")
+                break
 
-    print(f"训练完成。最佳验证准确率 Top-1={best_acc:.4f}")
+    # 保存训练历史
+    history.save()
+    
+    print(f"\n训练完成")
+    print(f"最佳验证准确率 Top-1={best_acc:.4f}")
+    if early_stopping is not None and early_stopping.early_stop:
+        print(f"提前停止于第 {epoch} 个epoch (早停耐心值: {args.patience})")
 
 if __name__ == "__main__":
     main()

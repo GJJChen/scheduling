@@ -1,1 +1,15 @@
 data/train.npz
+generate_dataset.py
+diagnose_data.py
+config.py
+models/
+logs/
+*.ckpt
+*.h5
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.env
+.ipynb_checkpoints/
+results/
