@@ -225,10 +225,10 @@ def check_dataset_labels(npz_path: str, sample_limit: Optional[int] = None) -> f
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="data/train.npz", help="npz 数据集路径")
-    ap.add_argument("--model", type=str, default="hier", choices=["bilstm", "mlp", "transformer", "hier"])
+    ap.add_argument("--model", type=str, default="bilstm", choices=["bilstm", "mlp", "transformer", "hier"])
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--batch-size", type=int, default=256)  # 降低batch size提升稳定性
-    ap.add_argument("--lr", type=float, default=1e-2)  # 进一步降低学习率
+    ap.add_argument("--lr", type=float, default=1e-3)  # 进一步降低学习率
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=2025)
     ap.add_argument("--save", type=str, default="checkpoints/best.pt")

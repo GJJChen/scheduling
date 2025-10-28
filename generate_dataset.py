@@ -58,12 +58,12 @@ def generate_batch(args_tuple):
             neg_stats[k] += v
         
         generated += 1
-    
+
     return X_batch, y_batch, neg_stats
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=200_000, help="样本数")
+    ap.add_argument("--n", type=int, default=1000_000, help="样本数")
     ap.add_argument("--out", type=str, default="data/train.npz", help="输出 npz 路径")
     ap.add_argument("--seed", type=int, default=2025, help="随机种子")
     ap.add_argument("--workers", type=int, default=None, help="并行进程数（默认为CPU核心数）")
