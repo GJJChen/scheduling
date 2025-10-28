@@ -27,20 +27,21 @@ class SchedulingNPZDataset(Dataset):
             self.label_mode = "user"
             self.num_classes = CFG.N_USERS
         
-        # 计算归一化参数（基于整个数据集）
+        # 计算归一化参数（基于整个数据集的实际最大值）
         if self.normalize:
-            # buffer_bytes 归一化 (VO/VI/BE分别归一化)
+            # buffer_bytes 归一化 (VO/VI/BE分别计算最大值)
+            # X shape: [N, 128, 3, 2] - 维度2是服务类型(VO/VI/BE)，维度3是属性(buffer/wait)
             self.buf_max = np.array([
-                CFG.BUF_RANGE['VO'][1],  # VO max
-                CFG.BUF_RANGE['VI'][1],  # VI max
-                CFG.BUF_RANGE['BE'][1],  # BE max
+                self.X[:, :, 0, 0].max(),  # VO buffer max
+                self.X[:, :, 1, 0].max(),  # VI buffer max
+                self.X[:, :, 2, 0].max(),  # BE buffer max
             ], dtype=np.float32)
             
-            # wait_ms 归一化 (VO/VI/BE分别归一化)
+            # wait_ms 归一化 (VO/VI/BE分别计算最大值)
             self.wait_max = np.array([
-                CFG.WAIT_RANGE['VO'][1],  # VO max
-                CFG.WAIT_RANGE['VI'][1],  # VI max
-                CFG.WAIT_RANGE['BE'][1],  # BE max
+                self.X[:, :, 0, 1].max(),  # VO wait max
+                self.X[:, :, 1, 1].max(),  # VI wait max
+                self.X[:, :, 2, 1].max(),  # BE wait max
             ], dtype=np.float32)
 
     def __len__(self):
