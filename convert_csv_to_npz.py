@@ -20,7 +20,7 @@ from tqdm import tqdm
 from config import CFG
 
 
-def convert_csv_to_npz(input_csv, output_csv, out_npz, label_mode='combined'):
+def convert_csv_to_npz(input_csv, output_csv, out_npz, label_mode='combined', swap_last_dim=False):
     """
     转换CSV数据集为npz格式
     
@@ -31,6 +31,7 @@ def convert_csv_to_npz(input_csv, output_csv, out_npz, label_mode='combined'):
         label_mode: 标签编码模式
             - 'combined': y = user * 3 + service (0-383)
             - 'user': y = user (0-127)
+        swap_last_dim: 是否交换最后一个维度（大小为2）的两个属性的顺序
     """
     print(f"读取输入文件: {input_csv}")
     # 读取输入CSV（跳过第一行序号列）
@@ -75,6 +76,11 @@ def convert_csv_to_npz(input_csv, output_csv, out_npz, label_mode='combined'):
         # 将 768 维向量重塑为 [128, 3, 2]
         X[i] = input_data[i].reshape(CFG.N_USERS, 3, 2)
     
+    # 如果需要，交换最后一个维度的两个属性的顺序
+    if swap_last_dim:
+        print("交换最后一个维度的两个属性顺序 (.., 2) -> (.., [1, 0])")
+        X = X[..., [1, 0]]
+
     # 转换输出数据：提取用户ID和业务ID
     print("处理输出标签...")
     users = output_data[:, 0].astype(np.int64)  # 用户ID (0-127)
@@ -116,16 +122,22 @@ def convert_csv_to_npz(input_csv, output_csv, out_npz, label_mode='combined'):
     os.makedirs(os.path.dirname(out_npz), exist_ok=True)
     print(f"\n保存到: {out_npz}")
     
+    # 根据是否交换调整元数据中的属性顺序
+    attrs_meta = list(getattr(CFG, 'ATTRS', []))
+    if swap_last_dim and len(attrs_meta) == 2:
+        attrs_meta = attrs_meta[::-1]
+
     np.savez_compressed(
         out_npz,
         X=X,
         y=y,
         meta=dict(
             services=CFG.SERVICES,
-            attrs=CFG.ATTRS,
+            attrs=attrs_meta,
             n_users=CFG.N_USERS,
             label_mode=label_mode,
-            n_samples=n_samples
+            n_samples=n_samples,
+            swapped_last_dim=bool(swap_last_dim)
         )
     )
     
@@ -150,7 +162,9 @@ def main():
     parser.add_argument("--label-mode", type=str, default="combined",
                         choices=['combined', 'user'],
                         help="标签编码模式：combined(user*3+service) 或 user(仅用户ID)")
-    
+    parser.add_argument("--swap-last-dim", action="store_true",
+                        help="是否交换最后一个维度（大小为2）的两个属性的顺序")
+
     args = parser.parse_args()
     
     # 检查输入文件是否存在
@@ -164,7 +178,8 @@ def main():
         input_csv=args.input,
         output_csv=args.output,
         out_npz=args.out_npz,
-        label_mode=args.label_mode
+        label_mode=args.label_mode,
+        swap_last_dim=args.swap_last_dim
     )
 
 
