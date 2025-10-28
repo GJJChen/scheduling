@@ -3,13 +3,13 @@ SETLOCAL
 
 :: --- 配置 ---
 :: 1. 设置你的 Conda 环境名称
-SET "ENV_NAME=FLmed"
+SET "ENV_NAME=pytorch_env"
 
 :: 2. 设置训练脚本的路径 (假设此 .bat 文件与 train.py 在同一目录)
 SET "SCRIPT_PATH=train.py"
 
 :: 3. 设置训练的 Epochs (设为较小的值, 比如 1, 仅用于测试是否能跑通)
-SET "EPOCHS=10"
+SET "EPOCHS=150"
 :: --- 配置结束 ---
 
 ECHO 启动模型性能测试循环...
