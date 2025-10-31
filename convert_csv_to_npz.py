@@ -184,7 +184,7 @@ def main():
         
         # 匹配输入输出文件对
         file_pairs = {}
-        pattern = re.compile(r'(input|output)_data_([^_]+)_([^_]+)_set\.csv')
+        pattern = re.compile(r'(input|output)_data_([^_]+)_(.+)_set\.csv')
         
         for f in input_files + output_files:
             basename = os.path.basename(f)
