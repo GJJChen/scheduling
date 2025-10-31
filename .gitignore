@@ -13,3 +13,4 @@ __pycache__/
 .env
 .ipynb_checkpoints/
 results/
+.idea/
