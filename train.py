@@ -80,6 +80,13 @@ class TrainingHistory:
         self.history['val_top10'].append(float(val_top10))
         self.history['learning_rate'].append(float(lr))
     
+    def add_test_results(self, test_loss, test_acc, test_top5, test_top10):
+        """添加测试结果"""
+        self.history['test_loss'] = float(test_loss)
+        self.history['test_acc'] = float(test_acc)
+        self.history['test_top5'] = float(test_top5)
+        self.history['test_top10'] = float(test_top10)
+    
     def save(self):
         """存到JSON"""
         save_path = os.path.join(self.save_dir, f"{self.model_name}_history.json")
@@ -203,11 +210,12 @@ def evaluate(model, loader, device, epoch=None, amp_enabled=False,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, default="data/train.npz", help="npz 数据集路径")
+    ap.add_argument("--data", type=str, default="data/train.npz", help="npz 训练数据集路径")
+    ap.add_argument("--test-data", type=str, help="npz 测试数据集路径（可选，从不同场景加载测试集）")
     ap.add_argument("--model", type=str, default="bilstm", choices=["bilstm", "mlp", "transformer", "hier"])
-    ap.add_argument("--epochs", type=int, default=10)
-    ap.add_argument("--batch-size", type=int, default=2048)  # 降低batch size提升稳定性
-    ap.add_argument("--lr", type=float, default=1e-2)  # 进一步降低学习率
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--batch-size", type=int, default=256)  # 降低batch size提升稳定性
+    ap.add_argument("--lr", type=float, default=1e-4)  # 进一步降低学习率
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=2025)
     ap.add_argument("--save", type=str, default="checkpoints/best.pt")
@@ -248,13 +256,39 @@ def main():
             pass
 
     # 数据
-    full = SchedulingNPZDataset(args.data, normalize=True, precompute=True)
-    num_classes = full.num_classes
-    label_mode = full.label_mode
-    n_users = full.n_users
-    print(f"数据集标签模式: {label_mode}, 类别数: {num_classes}, 用户数: {n_users}")
-    
-    train_ds, val_ds = split_dataset(full, val_ratio=args.val_ratio, seed=args.seed)
+    if args.test_data:
+        # 使用不同数据集作为训练和测试
+        train_full = SchedulingNPZDataset(args.data, normalize=True, precompute=True)
+        test_full = SchedulingNPZDataset(args.test_data, normalize=True, precompute=True)
+        
+        # 检查标签模式是否一致
+        if train_full.label_mode != test_full.label_mode:
+            raise ValueError(f"训练集和测试集标签模式不一致: {train_full.label_mode} vs {test_full.label_mode}")
+        if train_full.num_classes != test_full.num_classes:
+            raise ValueError(f"训练集和测试集类别数不一致: {train_full.num_classes} vs {test_full.num_classes}")
+        
+        # 从训练集中分割出验证集
+        train_ds, val_ds = split_dataset(train_full, val_ratio=args.val_ratio, seed=args.seed)
+        # 测试集作为独立的测试数据
+        from torch.utils.data import DataLoader as DL
+        test_loader = DL(test_full, batch_size=args.batch_size, shuffle=False, **dl_common)
+        
+        num_classes = train_full.num_classes
+        label_mode = train_full.label_mode
+        n_users = train_full.n_users
+        print(f"训练数据集: {args.data}, 测试数据集: {args.test_data}")
+        print(f"数据集标签模式: {label_mode}, 类别数: {num_classes}, 用户数: {n_users}")
+        print(f"训练样本数: {len(train_ds)}, 验证样本数: {len(val_ds)}, 测试样本数: {len(test_full)}")
+    else:
+        # 原有逻辑：从单个数据集中分割
+        full = SchedulingNPZDataset(args.data, normalize=True, precompute=True)
+        num_classes = full.num_classes
+        label_mode = full.label_mode
+        n_users = full.n_users
+        print(f"数据集标签模式: {label_mode}, 类别数: {num_classes}, 用户数: {n_users}")
+        
+        train_ds, val_ds = split_dataset(full, val_ratio=args.val_ratio, seed=args.seed)
+        test_loader = None  # 不使用独立的测试集
 
     dl_common = dict(num_workers=args.num_workers)
     if device == "cuda":
@@ -350,6 +384,23 @@ def main():
     print(f"最佳验证准确率 Top-1={best_acc:.4f}")
     if early_stopping is not None and early_stopping.early_stop:
         print(f"提前停止于第 {epoch} 个epoch (早停耐心值: {args.patience})")
+    
+    # 如果有独立的测试集，进行最终测试
+    if test_loader is not None:
+        print("\n加载最佳模型进行测试...")
+        checkpoint = torch.load(args.save, map_location=device)
+        model.load_state_dict(checkpoint['state_dict'])
+        model.eval()
+        
+        te_loss, te_acc, te_top5, te_top10 = evaluate(
+            model, test_loader, device, epoch="Test",
+            amp_enabled=bool(args.amp), non_blocking=non_blocking
+        )
+        print(f"测试结果: loss={te_loss:.4f} acc={te_acc:.4f} top5={te_top5:.4f} top10={te_top10:.4f}")
+        
+        # 将测试结果添加到历史记录
+        history.add_test_results(te_loss, te_acc, te_top5, te_top10)
+        history.save()
 
 if __name__ == "__main__":
     main()

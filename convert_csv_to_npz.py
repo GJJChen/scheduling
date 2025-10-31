@@ -153,12 +153,14 @@ def convert_csv_to_npz(input_csv, output_csv, out_npz, label_mode='combined', sw
 
 def main():
     parser = argparse.ArgumentParser(description="将CSV格式数据集转换为npz格式")
-    parser.add_argument("--input", type=str, required=True, 
+    parser.add_argument("--input", type=str,
                         help="输入CSV文件路径（展平的768维特征）")
-    parser.add_argument("--output", type=str, required=True,
+    parser.add_argument("--output", type=str,
                         help="输出CSV文件路径（用户ID和业务ID）")
+    parser.add_argument("--data-dir", type=str,
+                        help="包含多个CSV数据集的文件夹路径")
     parser.add_argument("--out-npz", type=str, default="data/train.npz",
-                        help="输出npz文件路径（默认: data/train.npz）")
+                        help="输出npz文件路径（单个文件模式）")
     parser.add_argument("--label-mode", type=str, default="combined",
                         choices=['combined', 'user'],
                         help="标签编码模式：combined(user*3+service) 或 user(仅用户ID)")
@@ -167,20 +169,68 @@ def main():
 
     args = parser.parse_args()
     
-    # 检查输入文件是否存在
-    if not os.path.exists(args.input):
-        raise FileNotFoundError(f"输入文件不存在: {args.input}")
-    if not os.path.exists(args.output):
-        raise FileNotFoundError(f"输出文件不存在: {args.output}")
-    
-    # 执行转换
-    convert_csv_to_npz(
-        input_csv=args.input,
-        output_csv=args.output,
-        out_npz=args.out_npz,
-        label_mode=args.label_mode,
-        swap_last_dim=args.swap_last_dim
-    )
+    # 检查参数
+    if args.data_dir:
+        # 多文件模式
+        if not os.path.isdir(args.data_dir):
+            raise ValueError(f"数据文件夹不存在: {args.data_dir}")
+        
+        # 扫描文件夹中的CSV文件
+        import glob
+        import re
+        
+        input_files = glob.glob(os.path.join(args.data_dir, "input_data_*_set.csv"))
+        output_files = glob.glob(os.path.join(args.data_dir, "output_data_*_set.csv"))
+        
+        # 匹配输入输出文件对
+        file_pairs = {}
+        pattern = re.compile(r'(input|output)_data_([^_]+)_([^_]+)_set\.csv')
+        
+        for f in input_files + output_files:
+            basename = os.path.basename(f)
+            match = pattern.match(basename)
+            if match:
+                io_type, business, scenario = match.groups()
+                key = f"{business}_{scenario}"
+                if key not in file_pairs:
+                    file_pairs[key] = {}
+                file_pairs[key][io_type] = f
+        
+        # 处理每个数据集
+        for key, files in file_pairs.items():
+            if 'input' in files and 'output' in files:
+                business, scenario = key.split('_', 1)
+                out_npz = os.path.join("data", f"{business}_{scenario}.npz")
+                print(f"\n处理数据集: {key}")
+                convert_csv_to_npz(
+                    input_csv=files['input'],
+                    output_csv=files['output'],
+                    out_npz=out_npz,
+                    label_mode=args.label_mode,
+                    swap_last_dim=args.swap_last_dim
+                )
+            else:
+                print(f"警告: 数据集 {key} 缺少输入或输出文件")
+        
+    else:
+        # 单文件模式（原有逻辑）
+        if not args.input or not args.output:
+            raise ValueError("单文件模式需要指定 --input 和 --output 参数")
+        
+        # 检查输入文件是否存在
+        if not os.path.exists(args.input):
+            raise FileNotFoundError(f"输入文件不存在: {args.input}")
+        if not os.path.exists(args.output):
+            raise FileNotFoundError(f"输出文件不存在: {args.output}")
+        
+        # 执行转换
+        convert_csv_to_npz(
+            input_csv=args.input,
+            output_csv=args.output,
+            out_npz=args.out_npz,
+            label_mode=args.label_mode,
+            swap_last_dim=args.swap_last_dim
+        )
 
 
 if __name__ == "__main__":

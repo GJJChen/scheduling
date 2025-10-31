@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from pickle import FALSE
 from typing import Optional
 
 import torch
@@ -17,7 +18,7 @@ class BiLSTMClassifier(nn.Module):
             input_size=input_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
-            bidirectional=True,
+            bidirectional=False,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
@@ -25,10 +26,10 @@ class BiLSTMClassifier(nn.Module):
         # *** 关键修复：改变分类头结构 ***
         if num_classes == n_users:
             # User模式: 每个用户输出一个logit
-            self.head = nn.Linear(hidden_size * 2, 1)
+            self.head = nn.Linear(hidden_size, 1)
         else:
             # Combined模式: 每个用户输出3个业务的logit
-            self.head = nn.Linear(hidden_size * 2, 3)
+            self.head = nn.Linear(hidden_size, 3)
 
     def forward(self, x):
         # x: [B, n_users, 6]
@@ -47,8 +48,12 @@ class MLPClassifier(nn.Module):
     """两种模式：
     - num_classes=n_users: 只预测用户
     - num_classes=n_users*n_services: 预测用户×业务组合
+
+    [已修复] 采用 'Per User' 架构，使其具有置换不变性，
+    使其能够拟合 'combined' 模式。
     """
-    def __init__(self, input_dim=6, hidden=256, layers=3, dropout=0.1, num_classes=128, n_users=128):
+
+    def __init__(self, input_dim=6, hidden=256, layers=4, dropout=0.1, num_classes=128, n_users=128):
         super().__init__()
         self.num_classes = num_classes
         self.n_users = n_users
@@ -64,33 +69,54 @@ class MLPClassifier(nn.Module):
                 nn.Dropout(dropout)
             ]
             d = hidden
-        
+
+        # --- 修复 ---
+        # 最终的线性层必须是 "Per User" 的
+        # 我们在这里直接定义输出维度
+
         if num_classes == n_users:
+            # 模式1: 每个用户输出1个logit
             blocks += [nn.Linear(hidden, 1)]
-            self.per_user = nn.Sequential(*blocks)
-            self.final = None
+
+        elif num_classes % n_users == 0:
+            # 模式2: 每个用户输出 N_SERVICES (e.g., 3) 个logits
+            n_services = num_classes // n_users
+            blocks += [nn.Linear(hidden, n_services)]
+
         else:
-            self.per_user = nn.Sequential(*blocks)
-            # Combined模式：添加最终分类层
-            self.final = nn.Sequential(
-                nn.Linear(hidden * n_users, hidden * 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden * 2, num_classes)
-            )
+            raise ValueError(f"num_classes ({num_classes}) 必须是 n_users ({n_users}) 的整数倍")
+
+        # per_user 模块现在包含了所有层
+        self.per_user = nn.Sequential(*blocks)
+
+        # 移除那个导致顺序敏感的 `final` 模块
+        self.final = None
 
     def forward(self, x):  # [B, n_users, 6]
         B, N, F = x.shape
-        x = x.view(B*N, F)
-        
+        # 将 [B, N, F] -> [B*N, F] 以便 nn.Sequential 可以处理
+        x = x.view(B * N, F)
+
+        # h 的形状是 [B*N, 1] (模式1) 或 [B*N, 3] (模式2)
+        h = self.per_user(x)
+
         if self.num_classes == self.n_users:
-            s = self.per_user(x).view(B, N)
+            # 模式1: [B*N, 1] -> [B, N]
+            s = h.view(B, N)
             return s
         else:
-            h = self.per_user(x).view(B, N, -1)  # [B, n_users, hidden]
-            h_flat = h.reshape(B, -1)  # [B, n_users*hidden]
-            logits = self.final(h_flat)  # [B, num_classes]
+            # --- 修复 ---
+            # 模式2: h 是 [B*N, n_services]
+
+            # 1. 恢复用户维度: [B*N, S] -> [B, N, S]
+            s_per_user = h.view(B, N, -1)
+
+            # 2. 展平为最终输出: [B, N, S] -> [B, N*S] (e.g., [B, 384])
+            # 这只是为了匹配 CrossEntropyLoss 的格式，
+            # 并且它发生在所有计算之后，所以是正确的。
+            logits = s_per_user.reshape(B, -1)
             return logits
+
 
 
 class TransformerClassifier(nn.Module):
