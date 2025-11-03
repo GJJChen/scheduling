@@ -219,7 +219,7 @@ def main():
     ap.add_argument("--val-ratio", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=2025)
     ap.add_argument("--save", type=str, default="checkpoints/best.pt")
-    ap.add_argument("--num-workers", type=int, default=8, help="DataLoader workers (Windows建议0)")
+    ap.add_argument("--num-workers", type=int, default=0, help="DataLoader workers (Windows建议0)")
     ap.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader 预取因子(>0且num_workers>0生效)")
     ap.add_argument("--persistent-workers", action="store_true", help="开启持久化workers以减少反复fork开销")
     # 早停相关参数
@@ -353,8 +353,14 @@ def main():
     # 构建模型名称（包含场景信息）
     if test_scenario:
         model_full_name = f"{args.model}_{label_mode}_train_{train_scenario}_test_{test_scenario}"
+        save_path = f"checkpoints/{train_scenario}_test_{test_scenario}_best.pt"
     else:
         model_full_name = f"{args.model}_{label_mode}_{train_scenario}"
+        save_path = f"checkpoints/{train_scenario}_best.pt"
+    
+    # 如果用户指定了保存路径且不是默认值，使用用户指定的路径
+    if args.save != "checkpoints/best.pt":
+        save_path = args.save
     
     history = TrainingHistory(
         model_name=model_full_name,
@@ -385,7 +391,7 @@ def main():
         # 保存最佳模型
         if va_acc > best_acc:
             best_acc = va_acc
-            os.makedirs(os.path.dirname(args.save), exist_ok=True)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
             
             # 保存模型和相关信息
             checkpoint = {
@@ -408,8 +414,8 @@ def main():
                 if norm_params is not None:
                     checkpoint['norm_params'] = norm_params
             
-            torch.save(checkpoint, args.save)
-            tqdm.write(f"  -> 保存最佳模型到: {args.save} (val_acc={best_acc:.4f})")
+            torch.save(checkpoint, save_path)
+            tqdm.write(f"  -> 保存最佳模型到: {save_path} (val_acc={best_acc:.4f})")
         
         # 早停检查
         if early_stopping is not None:
@@ -429,7 +435,7 @@ def main():
     # 如果有独立的测试集，进行最终测试
     if test_loader is not None:
         print("\n加载最佳模型进行测试...")
-        checkpoint = torch.load(args.save, map_location=device)
+        checkpoint = torch.load(save_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['state_dict'])
         model.eval()
         

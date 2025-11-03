@@ -29,6 +29,18 @@ python train.py --data data/train_scenario1.npz --test-data data/test_scenario2.
 - 使用 `test_scenario2.npz` 作为测试数据
 - 测试集会使用训练集的归一化参数
 - 保存的模型包含场景信息
+- **模型自动保存为**: `checkpoints/train_scenario1_test_test_scenario2_best.pt`
+
+如果只使用单个数据集（不指定 `--test-data`）：
+```powershell
+python train.py --data data/my_scenario.npz --model bilstm --epochs 100
+```
+- **模型自动保存为**: `checkpoints/my_scenario_best.pt`
+
+你也可以手动指定保存路径：
+```powershell
+python train.py --data data/train_scenario1.npz --test-data data/test_scenario2.npz --save checkpoints/my_custom_model.pt
+```
 
 ## 使用测试脚本
 
@@ -84,17 +96,19 @@ python convert_csv_to_npz.py --data-dir data/csv_files --label-mode combined
 
 ```powershell
 # 使用 mix 场景训练，valid 场景测试
-python train.py --data data/vi_all_mix_set.npz --test-data data/vi_all_valid_set.npz --model bilstm --epochs 100 --save checkpoints/bilstm_vi_mix.pt
+python train.py --data data/vi_all_mix_set.npz --test-data data/vi_all_valid_set.npz --model bilstm --epochs 100
+
+# 模型会自动保存为: checkpoints/vi_all_mix_set_test_vi_all_valid_set_best.pt
 ```
 
 ### 3. 在其他测试集上评估
 
 ```powershell
 # 在 train 场景上测试
-python test.py --checkpoint checkpoints/bilstm_vi_mix.pt --test-data data/vi_all_train_set.npz --output results/vi_mix_on_train.json
+python test.py --checkpoint checkpoints/vi_all_mix_set_test_vi_all_valid_set_best.pt --test-data data/vi_all_train_set.npz --output results/vi_mix_on_train.json
 
 # 在 be 场景上测试
-python test.py --checkpoint checkpoints/bilstm_vi_mix.pt --test-data data/be_all_mix_set.npz --output results/vi_mix_on_be.json
+python test.py --checkpoint checkpoints/vi_all_mix_set_test_vi_all_valid_set_best.pt --test-data data/be_all_mix_set.npz --output results/vi_mix_on_be.json
 ```
 
 ## 注意事项

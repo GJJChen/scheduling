@@ -66,7 +66,7 @@ def main():
     ap.add_argument("--checkpoint", type=str, required=True, help="模型检查点路径 (.pt文件)")
     ap.add_argument("--test-data", type=str, required=True, help="测试数据集路径 (.npz文件)")
     ap.add_argument("--batch-size", type=int, default=256, help="批次大小")
-    ap.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
+    ap.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
     ap.add_argument("--amp", action="store_true", help="使用混合精度推理")
     ap.add_argument("--output", type=str, help="结果输出JSON文件路径（可选）")
     args = ap.parse_args()
@@ -82,7 +82,7 @@ def main():
     
     # 加载模型检查点
     print(f"加载模型检查点: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     
     # 提取模型配置
     model_type = checkpoint['model']
