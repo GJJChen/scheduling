@@ -259,7 +259,12 @@ def main():
     if args.test_data:
         # 使用不同数据集作为训练和测试
         train_full = SchedulingNPZDataset(args.data, normalize=True, precompute=True)
-        test_full = SchedulingNPZDataset(args.test_data, normalize=True, precompute=True)
+        
+        # 获取训练集的归一化参数
+        train_norm_params = train_full.get_norm_params()
+        
+        # 测试集使用训练集的归一化参数
+        test_full = SchedulingNPZDataset(args.test_data, normalize=True, precompute=True, norm_params=train_norm_params)
         
         # 检查标签模式是否一致
         if train_full.label_mode != test_full.label_mode:
@@ -276,7 +281,13 @@ def main():
         num_classes = train_full.num_classes
         label_mode = train_full.label_mode
         n_users = train_full.n_users
-        print(f"训练数据集: {args.data}, 测试数据集: {args.test_data}")
+        
+        # 提取场景名称
+        train_scenario = os.path.splitext(os.path.basename(args.data))[0]  # 去掉 .npz
+        test_scenario = os.path.splitext(os.path.basename(args.test_data))[0]
+        
+        print(f"训练数据集: {args.data} (场景: {train_scenario})")
+        print(f"测试数据集: {args.test_data} (场景: {test_scenario})")
         print(f"数据集标签模式: {label_mode}, 类别数: {num_classes}, 用户数: {n_users}")
         print(f"训练样本数: {len(train_ds)}, 验证样本数: {len(val_ds)}, 测试样本数: {len(test_full)}")
     else:
@@ -285,6 +296,12 @@ def main():
         num_classes = full.num_classes
         label_mode = full.label_mode
         n_users = full.n_users
+        
+        # 提取场景名称
+        train_scenario = os.path.splitext(os.path.basename(args.data))[0]
+        test_scenario = None
+        
+        print(f"数据集: {args.data} (场景: {train_scenario})")
         print(f"数据集标签模式: {label_mode}, 类别数: {num_classes}, 用户数: {n_users}")
         
         train_ds, val_ds = split_dataset(full, val_ratio=args.val_ratio, seed=args.seed)
@@ -332,8 +349,14 @@ def main():
         mode='max'
     )
     
+    # 构建模型名称（包含场景信息）
+    if test_scenario:
+        model_full_name = f"{args.model}_{label_mode}_train_{train_scenario}_test_{test_scenario}"
+    else:
+        model_full_name = f"{args.model}_{label_mode}_{train_scenario}"
+    
     history = TrainingHistory(
-        model_name=f"{args.model}_{label_mode}",
+        model_name=model_full_name,
         save_dir=args.results_dir
     )
 
@@ -362,12 +385,29 @@ def main():
         if va_acc > best_acc:
             best_acc = va_acc
             os.makedirs(os.path.dirname(args.save), exist_ok=True)
-            torch.save(dict(
-                model=args.model, state_dict=model.state_dict(),
-                cfg=dict(n_users=n_users, num_classes=num_classes, label_mode=label_mode),
-                best_epoch=epoch,
-                best_val_acc=best_acc
-            ), args.save)
+            
+            # 保存模型和相关信息
+            checkpoint = {
+                'model': args.model,
+                'state_dict': model.state_dict(),
+                'cfg': {
+                    'n_users': n_users,
+                    'num_classes': num_classes,
+                    'label_mode': label_mode
+                },
+                'best_epoch': epoch,
+                'best_val_acc': best_acc,
+                'train_scenario': train_scenario,
+                'test_scenario': test_scenario
+            }
+            
+            # 如果使用了归一化，保存归一化参数
+            if hasattr(train_full if args.test_data else full, 'get_norm_params'):
+                norm_params = (train_full if args.test_data else full).get_norm_params()
+                if norm_params is not None:
+                    checkpoint['norm_params'] = norm_params
+            
+            torch.save(checkpoint, args.save)
             tqdm.write(f"  -> 保存最佳模型到: {args.save} (val_acc={best_acc:.4f})")
         
         # 早停检查
