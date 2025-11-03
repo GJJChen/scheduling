@@ -255,6 +255,15 @@ def main():
         except Exception:
             pass
 
+    # DataLoader配置
+    dl_common = dict(num_workers=args.num_workers)
+    if device == "cuda":
+        dl_common["pin_memory"] = True
+    if args.num_workers > 0:
+        if args.prefetch_factor and args.prefetch_factor > 0:
+            dl_common["prefetch_factor"] = args.prefetch_factor
+        dl_common["persistent_workers"] = bool(args.persistent_workers)
+
     # 数据
     if args.test_data:
         # 使用不同数据集作为训练和测试
@@ -275,8 +284,7 @@ def main():
         # 从训练集中分割出验证集
         train_ds, val_ds = split_dataset(train_full, val_ratio=args.val_ratio, seed=args.seed)
         # 测试集作为独立的测试数据
-        from torch.utils.data import DataLoader as DL
-        test_loader = DL(test_full, batch_size=args.batch_size, shuffle=False, **dl_common)
+        test_loader = DataLoader(test_full, batch_size=args.batch_size, shuffle=False, **dl_common)
         
         num_classes = train_full.num_classes
         label_mode = train_full.label_mode
@@ -307,13 +315,6 @@ def main():
         train_ds, val_ds = split_dataset(full, val_ratio=args.val_ratio, seed=args.seed)
         test_loader = None  # 不使用独立的测试集
 
-    dl_common = dict(num_workers=args.num_workers)
-    if device == "cuda":
-        dl_common["pin_memory"] = True
-    if args.num_workers > 0:
-        if args.prefetch_factor and args.prefetch_factor > 0:
-            dl_common["prefetch_factor"] = args.prefetch_factor
-        dl_common["persistent_workers"] = bool(args.persistent_workers)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **dl_common)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **dl_common)
 
