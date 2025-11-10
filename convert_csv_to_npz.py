@@ -151,12 +151,162 @@ def convert_csv_to_npz(input_csv, output_csv, out_npz, label_mode='combined', sw
     print(f"  Meta: {loaded['meta'].item()}")
 
 
+def merge_csv_to_npz(csv_pairs, out_npz, label_mode='combined', swap_last_dim=False):
+    """
+    合并多个CSV文件对为单个npz格式
+    
+    Args:
+        csv_pairs: CSV文件对列表，每个元素为 (input_csv, output_csv)
+        out_npz: 输出npz文件路径
+        label_mode: 标签编码模式
+        swap_last_dim: 是否交换最后一个维度的顺序
+    """
+    all_X = []
+    all_y = []
+    total_samples = 0
+    
+    print(f"开始合并 {len(csv_pairs)} 个CSV文件对...")
+    
+    for idx, (input_csv, output_csv) in enumerate(csv_pairs, 1):
+        print(f"\n[{idx}/{len(csv_pairs)}] 处理文件对:")
+        print(f"  输入: {input_csv}")
+        print(f"  输出: {output_csv}")
+        
+        # 读取输入CSV
+        df_input = pd.read_csv(input_csv)
+        
+        # 处理序号列
+        if df_input.shape[1] == 769:
+            input_data = df_input.iloc[:, 1:].values
+        elif df_input.shape[1] == 768:
+            input_data = df_input.values
+        else:
+            raise ValueError(f"输入CSV列数不符合预期：期望768或769列，实际{df_input.shape[1]}列")
+        
+        # 读取输出CSV
+        df_output = pd.read_csv(output_csv)
+        
+        if df_output.shape[1] == 3:
+            output_data = df_output.iloc[:, 1:].values
+        elif df_output.shape[1] == 2:
+            output_data = df_output.values
+        else:
+            raise ValueError(f"输出CSV列数不符合预期：期望2或3列，实际{df_output.shape[1]}列")
+        
+        # 检查行数匹配
+        n_samples = input_data.shape[0]
+        if output_data.shape[0] != n_samples:
+            raise ValueError(f"输入输出行数不匹配：输入{n_samples}行，输出{output_data.shape[0]}行")
+        
+        print(f"  样本数: {n_samples}")
+        
+        # 转换输入数据
+        X = np.zeros((n_samples, CFG.N_USERS, 3, 2), dtype=np.float32)
+        for i in range(n_samples):
+            X[i] = input_data[i].reshape(CFG.N_USERS, 3, 2)
+        
+        # 交换维度（如果需要）
+        if swap_last_dim:
+            X = X[..., [1, 0]]
+        
+        # 转换输出数据
+        users = output_data[:, 0].astype(np.int64)
+        services = output_data[:, 1].astype(np.int64)
+        
+        # 验证范围
+        if np.any((users < 0) | (users >= CFG.N_USERS)):
+            raise ValueError(f"用户ID超出范围 [0, {CFG.N_USERS-1}]")
+        if np.any((services < 0) | (services >= 3)):
+            raise ValueError("业务ID超出范围 [0, 2]")
+        
+        # 生成标签
+        if label_mode == 'combined':
+            y = users * 3 + services
+        elif label_mode == 'user':
+            y = users
+        else:
+            raise ValueError(f"未知的标签模式: {label_mode}")
+        
+        all_X.append(X)
+        all_y.append(y)
+        total_samples += n_samples
+    
+    # 合并所有数据
+    print(f"\n合并所有数据...")
+    X_merged = np.concatenate(all_X, axis=0)
+    y_merged = np.concatenate(all_y, axis=0)
+    
+    # 统计信息
+    print("\n合并后的数据统计:")
+    print(f"  总样本数: {total_samples}")
+    print(f"  X shape: {X_merged.shape}")
+    print(f"  y shape: {y_merged.shape}")
+    print(f"  X range: [{X_merged.min():.2f}, {X_merged.max():.2f}]")
+    print(f"  y range: [{y_merged.min()}, {y_merged.max()}]")
+    print(f"  y 唯一值数量: {len(np.unique(y_merged))}")
+    
+    # 业务分布统计
+    print("\n业务分布:")
+    if label_mode == 'combined':
+        services_merged = y_merged % 3
+    else:
+        # 需要从原始数据重新获取服务信息
+        services_merged = np.concatenate([np.full(len(y), -1) for y in all_y])
+        offset = 0
+        for input_csv, output_csv in csv_pairs:
+            df_output = pd.read_csv(output_csv)
+            if df_output.shape[1] == 3:
+                output_data = df_output.iloc[:, 1:].values
+            else:
+                output_data = df_output.values
+            services = output_data[:, 1].astype(np.int64)
+            services_merged[offset:offset+len(services)] = services
+            offset += len(services)
+    
+    for s in range(3):
+        count = np.sum(services_merged == s)
+        print(f"  {CFG.SERVICES[s]}: {count} ({count/total_samples*100:.2f}%)")
+    
+    # 保存为npz格式
+    os.makedirs(os.path.dirname(out_npz) if os.path.dirname(out_npz) else '.', exist_ok=True)
+    print(f"\n保存到: {out_npz}")
+    
+    # 准备元数据
+    attrs_meta = list(getattr(CFG, 'ATTRS', []))
+    if swap_last_dim and len(attrs_meta) == 2:
+        attrs_meta = attrs_meta[::-1]
+    
+    np.savez_compressed(
+        out_npz,
+        X=X_merged,
+        y=y_merged,
+        meta=dict(
+            services=CFG.SERVICES,
+            attrs=attrs_meta,
+            n_users=CFG.N_USERS,
+            label_mode=label_mode,
+            n_samples=total_samples,
+            swapped_last_dim=bool(swap_last_dim),
+            source_files=len(csv_pairs)
+        )
+    )
+    
+    print("合并完成！")
+    
+    # 验证保存的数据
+    print("\n验证保存的数据...")
+    loaded = np.load(out_npz, allow_pickle=True)
+    print(f"  X shape: {loaded['X'].shape}")
+    print(f"  y shape: {loaded['y'].shape}")
+    print(f"  Meta: {loaded['meta'].item()}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="将CSV格式数据集转换为npz格式")
     parser.add_argument("--input", type=str,
-                        help="输入CSV文件路径（展平的768维特征）")
+                        help="输入CSV文件路径（展平的768维特征），多个文件用逗号分隔")
     parser.add_argument("--output", type=str,
-                        help="输出CSV文件路径（用户ID和业务ID）")
+                        help="输出CSV文件路径（用户ID和业务ID），多个文件用逗号分隔")
     parser.add_argument("--data-dir", type=str,
                         help="包含多个CSV数据集的文件夹路径")
     parser.add_argument("--out-npz", type=str, default="data/train.npz",
@@ -166,11 +316,47 @@ def main():
                         help="标签编码模式：combined(user*3+service) 或 user(仅用户ID)")
     parser.add_argument("--swap-last-dim", action="store_true",
                         help="是否交换最后一个维度（大小为2）的两个属性的顺序")
+    parser.add_argument("--merge", action="store_true",
+                        help="合并多个CSV文件对到单个npz文件")
+
+    parser.add_argument("--merge", action="store_true",
+                        help="合并多个CSV文件对到单个npz文件")
 
     args = parser.parse_args()
     
     # 检查参数
-    if args.data_dir:
+    if args.merge:
+        # 合并模式：支持通过 --input 和 --output 指定多个文件
+        if not args.input or not args.output:
+            raise ValueError("合并模式需要指定 --input 和 --output 参数")
+        
+        # 分隔文件路径（支持逗号分隔）
+        input_files = [f.strip() for f in args.input.split(',')]
+        output_files = [f.strip() for f in args.output.split(',')]
+        
+        if len(input_files) != len(output_files):
+            raise ValueError(f"输入输出文件数量不匹配：{len(input_files)} vs {len(output_files)}")
+        
+        # 检查文件是否存在
+        for f in input_files:
+            if not os.path.exists(f):
+                raise FileNotFoundError(f"输入文件不存在: {f}")
+        for f in output_files:
+            if not os.path.exists(f):
+                raise FileNotFoundError(f"输出文件不存在: {f}")
+        
+        # 创建文件对列表
+        csv_pairs = list(zip(input_files, output_files))
+        
+        # 执行合并
+        merge_csv_to_npz(
+            csv_pairs=csv_pairs,
+            out_npz=args.out_npz,
+            label_mode=args.label_mode,
+            swap_last_dim=args.swap_last_dim
+        )
+        
+    elif args.data_dir:
         # 多文件模式
         if not os.path.isdir(args.data_dir):
             raise ValueError(f"数据文件夹不存在: {args.data_dir}")

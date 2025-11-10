@@ -605,7 +605,7 @@ if __name__ == "__main__":
     start_time = time.time()
     
     next_obs, _ = env.reset()
-    next_done = torch.zeros(1).to(DEVICE)
+    next_done = torch.zeros(1, dtype=torch.float32).to(DEVICE)
     
     num_updates = TOTAL_TRAINING_TIMESTEPS // N_STEPS
     
@@ -622,14 +622,14 @@ if __name__ == "__main__":
             # 2. 执行动作
             next_obs, reward, done, truncated, _ = env.step(action.cpu().numpy())
             reward = torch.tensor(reward).to(DEVICE).view(-1)
-            next_done = torch.tensor(done).to(DEVICE)
+            next_done = torch.tensor(done, dtype=torch.float32).to(DEVICE)
             
             # 3. 存储数据
             buffer.add(obs_tensor.cpu().numpy(), action, log_prob, reward, next_done, value.view(-1))
             
             if done or truncated:
                 next_obs, _ = env.reset()
-                next_done = torch.zeros(1).to(DEVICE)
+                next_done = torch.zeros(1, dtype=torch.float32).to(DEVICE)
         
         # 4. PPO 更新
         with torch.no_grad():
