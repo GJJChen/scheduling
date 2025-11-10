@@ -190,38 +190,58 @@ class SchedulerEnv(gym.Env):
         """获取用于计算奖励的当前统计数据"""
         return {
             "bytes_sent": sum(statistics["total_bytes_sent"]),
-            "bytes_dropped": sum(statistics["total_bytes_dropped"]),
-            "total_latency": sum(statistics["total_latency"]),
-            "packets_sent": sum(statistics["total_packets_sent"]),
+            # (修改) 返回每个AC的详细统计数据
+            "bytes_dropped_ac": statistics["total_bytes_dropped"][:], # 复制列表
+            "latency_ac": statistics["total_latency"][:], # 复制列表
+            "packets_sent_ac": statistics["total_packets_sent"][:] # 复制列表
         }
 
     def _calculate_reward(self):
         """根据两步之间的统计数据变化计算奖励"""
         new_stats = self._get_current_stats()
         
-        # 计算差值
+        # --- A. 计算差值 (Delta) ---
         delta_bytes_sent = new_stats["bytes_sent"] - self.last_step_stats["bytes_sent"]
-        delta_bytes_dropped = new_stats["bytes_dropped"] - self.last_step_stats["bytes_dropped"]
-        delta_latency = new_stats["total_latency"] - self.last_step_stats["total_latency"]
-        delta_packets_sent = new_stats["packets_sent"] - self.last_step_stats["packets_sent"]
         
-        # 奖励吞吐量
-        # (将字节转换为“兆字节”级别，避免数值过大)
-        reward_throughput = delta_bytes_sent / 1000000.0
+        delta_bytes_dropped_vo = new_stats["bytes_dropped_ac"][0] - self.last_step_stats["bytes_dropped_ac"][0]
+        delta_bytes_dropped_vi = new_stats["bytes_dropped_ac"][1] - self.last_step_stats["bytes_dropped_ac"][1]
+
+        delta_latency_vo = new_stats["latency_ac"][0] - self.last_step_stats["latency_ac"][0]
+        delta_latency_vi = new_stats["latency_ac"][1] - self.last_step_stats["latency_ac"][1]
         
-        # 惩罚丢包
-        penalty_dropped = delta_bytes_dropped / 1000000.0
+        delta_packets_sent_vo = new_stats["packets_sent_ac"][0] - self.last_step_stats["packets_sent_ac"][0]
+        delta_packets_sent_vi = new_stats["packets_sent_ac"][1] - self.last_step_stats["packets_sent_ac"][1]
+
+        # --- B. 计算奖励的各个组成部分 ---
         
-        # 惩罚时延
-        avg_latency_this_step = (delta_latency / delta_packets_sent) if delta_packets_sent > 0 else 0
-        # (将毫秒时延缩放)
-        penalty_latency = avg_latency_this_step / 100.0 
+        # 1. 吞吐量奖励 (基准)
+        reward_throughput = (delta_bytes_sent / 1000000.0) * 1.0 # 每发送 1MB 奖励 +1.0
+
+        # 2. 丢包惩罚 (关键修复：差异化惩罚)
+        # (惩罚值基于 1MB 的数据量)
+        # VO 丢包是不可容忍的 -> 给予巨大惩罚
+        penalty_dropped_vo = (delta_bytes_dropped_vo / 1000000.0) * 1000.0 # 每丢 1MB VO 惩罚 -1000
+        # VI 丢包是糟糕的 -> 给予高惩罚
+        penalty_dropped_vi = (delta_bytes_dropped_vi / 1000000.0) * 50.0  # 每丢 1MB VI 惩罚 -50
         
-        # **（关键）奖励函数**
-        # 这是你需要重点调优的地方
-        reward = (reward_throughput * 1.0) - (penalty_dropped * 2.0) - (penalty_latency * 0.5)
+        # 3. 时延惩罚 (可选，但有益)
+        avg_latency_vo = (delta_latency_vo / delta_packets_sent_vo) if delta_packets_sent_vo > 0 else 0
+        avg_latency_vi = (delta_latency_vi / delta_packets_sent_vi) if delta_packets_sent_vi > 0 else 0
         
-        # 更新上一步的统计
+        # 惩罚超过 5ms 的 VO 时延和超过 25ms 的 VI 时延
+        penalty_latency_vo = max(0, avg_latency_vo - 5) * 0.1 # 每毫秒 VO 延迟惩罚 -0.1
+        penalty_latency_vi = max(0, avg_latency_vi - 25) * 0.05 # 每毫秒 VI 延迟惩罚 -0.05
+
+        # --- C. 最终奖励 ---
+        reward = (
+            reward_throughput
+            - penalty_dropped_vo
+            - penalty_dropped_vi
+            - penalty_latency_vo
+            - penalty_latency_vi
+        )
+        
+        # --- D. 更新 last_step_stats ---
         self.last_step_stats = new_stats
         
         return reward
@@ -292,33 +312,96 @@ class SchedulerEnv(gym.Env):
         return vo_list, vi_list, be_list
 
     def _run_traditional_scheduler(self, vo, vi, be, timestamp):
-        """(内部) 运行一次传统调度逻辑"""
-        sorted_vo_list = sorted(vo, key=cmp_to_key(cmp))
-        for item in sorted_vo_list:
-            if timestamp - item["timestamp"] <= 20:
-                return {"uid": item['uid'], "ac_type": 0}
+        """
+        (关键修复) 
+        严格复原 import random.txt 中的 gen_sched_res 逻辑。
+        这是一个4级混合调度器：
+        1. 优先调度 新鲜的 VO (<= 20ms)
+        2. 其次调度 窗口期的 VI (20ms < t <= 50ms)
+        3. 其次调度 陈旧的 BE (> 100ms)
+        4. Fallback: 调度 VI 或 BE 中队列最长 (bytes) 的一个
+        """
         
-        sorted_vi_list = sorted(vi, key=cmp_to_key(cmp))
-        for item in sorted_vi_list:
-            if 20 < timestamp - item["timestamp"] <= 50:
-                 return {"uid": item['uid'], "ac_type": 1}
+        # 注意：vo, vi, be 列表已经由 _handle_timeouts_and_get_lists 过滤掉了
+        # 超时的包。但为了 100% 复现原始逻辑，我们必须重新执行
+        # 原始的 "gen_sched_res" 内部的超时和调度逻辑。
+        
+        # --- 严格复原 gen_sched_res (lines 110-210) ---
+        
+        # 1. 重新从 tx_info_table 获取所有队列头
+        vo_list = []
+        vi_list = []
+        be_list = []
+        
+        for uid in range(self.user_num):
+            for ac in range(3):
+                w_ptr = self.tx_info_table[uid][ac]["write_ptr"]
+                r_ptr = self.tx_info_table[uid][ac]["read_ptr"]
+                if w_ptr != r_ptr: # 队列非空
+                    pkt_info = self.txq_table[uid][ac][r_ptr]
+                    schedule_info = {
+                        "uid" : uid,
+                        "ac_type" : ac,
+                        "size" : self.tx_info_table[uid][ac]["tot_size"], # 原始代码使用 tot_size
+                        "timestamp" : pkt_info['timestamp']
+                    }
+                    if ac == 0:
+                        vo_list.append(schedule_info)
+                    elif ac == 1:
+                        vi_list.append(schedule_info)
+                    else:
+                        be_list.append(schedule_info)
 
-        sorted_be_list = sorted(be, key=cmp_to_key(cmp))
-        for item in sorted_be_list:
-            if timestamp - item["timestamp"] > 100:
-                return {"uid": item['uid'], "ac_type": 2}
-        
-        # RR 调度
+        if len(vo_list) == 0 and len(vi_list) == 0 and len(be_list) == 0:
+            return {"uid" : -1, "ac_type" : -1}
+
+        sorted_vo_list = sorted(vo_list, key=cmp_to_key(cmp))
+        sorted_vi_list = sorted(vi_list, key=cmp_to_key(cmp))
+        sorted_be_list = sorted(be_list, key=cmp_to_key(cmp))
+
+        # 2. 尝试调度 VO (优先级 1)
+        for i in range(len(sorted_vo_list)):
+            # 检查新鲜的VO包
+            if timestamp - sorted_vo_list[i]["timestamp"] <= 20 and sorted_vo_list[i]["timestamp"] < timestamp:
+                return {"uid" : sorted_vo_list[i]['uid'], "ac_type" : 0}
+            
+            # 原始逻辑也包含丢包，但这已在 _handle_timeouts_and_get_lists 中完成
+            # 为避免重复丢包，我们只关注调度决策
+            # (注: _handle_timeouts_and_get_lists 已经丢弃了 > 20ms 的包)
+
+        # 3. 尝试调度 VI (优先级 2)
+        for i in range(len(sorted_vi_list)):
+            # 检查窗口期的VI包
+            if 20 < timestamp - sorted_vi_list[i]["timestamp"] <= 50 and sorted_vi_list[i]["timestamp"] < timestamp:
+                return {"uid" : sorted_vi_list[i]['uid'], "ac_type" : 1}
+            # (注: _handle_timeouts_and_get_lists 已经丢弃了 > 50ms 的包)
+            
+        # 4. 尝试调度 BE (优先级 3)
+        for i in range(len(sorted_be_list)):
+            # 检查陈旧的BE包
+            if timestamp - sorted_be_list[i]["timestamp"] > 100 and sorted_be_list[i]["timestamp"] < timestamp:
+                return {"uid" : sorted_be_list[i]['uid'], "ac_type" : 2}
+
+        # 5. Fallback (优先级 4): 调度 VI 或 BE 中最长的队列
         max_pkt_size = 0
-        res_uid, res_ac_type = -1, -1
-        all_lists = sorted_vi_list + sorted_be_list # 优先 VI
-        for item in all_lists:
-             if item["size"] > max_pkt_size:
-                max_pkt_size = item["size"]
-                res_uid = item["uid"]
-                res_ac_type = item["ac_type"]
-                
-        return {"uid": res_uid, "ac_type": res_ac_type}
+        res_uid = -1
+        res_ac_type = -1
+        
+        # 原始 Fallback 逻辑 (只检查 VI 和 BE)
+        for i in range(self.user_num):
+            if self.tx_info_table[i][1]["tot_size"] > max_pkt_size:
+                res_uid = i
+                max_pkt_size = self.tx_info_table[i][1]["tot_size"]
+                res_ac_type = 1
+        
+        for i in range(self.user_num):
+            if self.tx_info_table[i][2]["tot_size"] > max_pkt_size:
+                res_uid = i
+                max_pkt_size = self.tx_info_table[i][2]["tot_size"]
+                res_ac_type = 2
+
+        return {"uid" : res_uid, "ac_type" : res_ac_type}
+        # --- 严格复原结束 ---
 
     def _execute_schedule(self, sched_uid, sched_tid, timestamp):
         """(内部) 执行调度，发送数据包，返回发送耗时"""
@@ -572,11 +655,11 @@ if __name__ == "__main__":
     USER_NUM = 8                 # (调小) 用户数，原为 32。数量越多，状态空间越大，训练越慢
     QUEUE_SIZE = 64              # (调小) 队列大小，原为 512
     SIM_DURATION_MS = 10000      # (调小) 每个 episode 的仿真时长 (10 秒)
-    STEP_DURATION_MS = 10        # 每个 PPO step 仿真 10ms
+    STEP_DURATION_MS = 1         # (修改) 关键修复：从 10ms 降为 1ms，以处理 20ms 的 VO 超时
     
-    TOTAL_TRAINING_TIMESTEPS = 10000 # (调小) 总训练步数，用于快速演示
-    N_STEPS = 128                # PPO 缓冲区大小
-    BATCH_SIZE = 64
+    TOTAL_TRAINING_TIMESTEPS = 50000 # (修改) 增加训练步数，以匹配更小的步长
+    N_STEPS = 512                # (修改) 增加缓冲区大小
+    BATCH_SIZE = 128             # (修改) 增加批量大小
     N_EPOCHS = 4
     GAMMA = 0.99
     GAE_LAMBDA = 0.95
@@ -682,51 +765,64 @@ if __name__ == "__main__":
     # --- 2. 最终评估 ---
     
     EVAL_DURATION_MS = 50000 # 评估 50 秒
+    EVAL_SEED = 42 # (新增) 定义一个固定的种子，确保流量公平
     
     # --- 评估 A: 传统调度器 ---
     print("\n--- 正在评估: 传统调度器 ---")
+    
+    # (新增) 设置固定种子
+    random.seed(EVAL_SEED)
+    np.random.seed(EVAL_SEED)
+    
     reset_statistics()
     eval_env = SchedulerEnv(USER_NUM, QUEUE_SIZE, EVAL_DURATION_MS, 1) # step=1ms
-    obs, _ = eval_env.reset()
+    obs, _ = eval_env.reset(seed=EVAL_SEED) # (新增) 传递种子
     done = False
     
-    while not done:
-        # **在这里，我们不使用 PPO 动作，而是调用传统调度逻辑**
+    # (关键修复) 重写传统评估循环，使其由事件驱动
+    while True:
+        if not eval_env.event_queue:
+            # print("传统评估：事件队列为空。")
+            break
+            
+        task = heapq.heappop(eval_env.event_queue)
         
-        # 1. 清理超时并获取列表
-        vo, vi, be = eval_env._handle_timeouts_and_get_lists(eval_env.current_time)
+        if task.timestamp > EVAL_DURATION_MS:
+            # print(f"传统评估：达到 {EVAL_DURATION_MS} ms 结束时间。")
+            break
+            
+        eval_env.current_time = task.timestamp
         
-        # 2. 运行传统调度器
-        sched_res = eval_env._run_traditional_scheduler(vo, vi, be, eval_env.current_time)
-        
-        # 3. 将传统决策 (dict) 转换为 PPO 动作 (int)
-        #    (这一步只是为了能调用 env.step()，实际上 step 里的 PPO 逻辑会被忽略)
-        #    我们将在 step 内部“劫持”这个决策
-        #    为了简单起见... 我们直接调用内部函数
-        
-        send_time = eval_env._execute_schedule(sched_res["uid"], sched_res["ac_type"], eval_env.current_time)
-        eval_env.current_time += send_time
-        
-        # 手动驱动流量生成器 (因为我们没有调用 step)
-        if "next_traffic_gen" not in locals() or eval_env.current_time >= next_traffic_gen:
-            eval_env._traffic_generator(eval_env.current_time)
-            # 找到下一个流量生成事件
-            next_traffic_gen = float('inf')
-            for task in eval_env.event_queue:
-                if task.event == "traffic_generate":
-                    next_traffic_gen = task.timestamp
-                    break
-        
-        done = eval_env.current_time >= EVAL_DURATION_MS
+        if task.event == "traffic_generate":
+            eval_env._traffic_generator(task.timestamp)
+            
+        elif task.event == "schedule":
+            # 1. 清理超时并获取列表
+            vo, vi, be = eval_env._handle_timeouts_and_get_lists(eval_env.current_time)
+            
+            # 2. 运行传统调度器
+            sched_res = eval_env._run_traditional_scheduler(vo, vi, be, eval_env.current_time)
+            
+            # 3. 执行调度
+            send_time = eval_env._execute_schedule(sched_res["uid"], sched_res["ac_type"], eval_env.current_time)
+            
+            # 4. 重新安排下一次调度事件
+            heapq.heappush(eval_env.event_queue, Task("schedule", eval_env.current_time + send_time))
 
     print_statistics("Traditional", EVAL_DURATION_MS)
 
 
     # --- 评估 B: 训练好的 PPO 调度器 ---
     print("\n--- 正在评估: PPO 调度器 (已训练) ---")
+    
+    # (新增) 重新设置 *完全相同* 的种子
+    random.seed(EVAL_SEED)
+    np.random.seed(EVAL_SEED)
+    
     reset_statistics()
-    eval_env = SchedulerEnv(USER_NUM, QUEUE_SIZE, EVAL_DURATION_MS, 10) # step=10ms
-    obs, _ = eval_env.reset()
+    # (关键修复) PPO 评估的 step 必须匹配训练的 step (1ms)
+    eval_env = SchedulerEnv(USER_NUM, QUEUE_SIZE, EVAL_DURATION_MS, 1) # step=1ms
+    obs, _ = eval_env.reset(seed=EVAL_SEED) # (新增) 传递种子
     done = False
     
     agent.eval() # 设置为评估模式

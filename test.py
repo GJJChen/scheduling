@@ -70,6 +70,7 @@ def main():
     ap.add_argument("--amp", action="store_true", help="使用混合精度推理")
     ap.add_argument("--output", type=str, help="结果输出JSON文件路径（可选）")
     args = ap.parse_args()
+    # print("测试参数:", args)
     
     # 检查文件是否存在
     if not os.path.exists(args.checkpoint):
