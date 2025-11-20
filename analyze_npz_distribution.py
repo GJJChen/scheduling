@@ -127,7 +127,15 @@ def analyze_npz(npz_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Analyze NPZ dataset distribution")
-    parser.add_argument("--file", type=str, default="data/train.npz", help="Path to the .npz file")
+    parser.add_argument("--path", type=str, default="data/train.npz", help="Path to the .npz file or directory containing .npz files")
     args = parser.parse_args()
 
-    analyze_npz(args.file)
+    if os.path.isdir(args.path):
+        print(f"Processing directory: {args.path}")
+        files = [f for f in os.listdir(args.path) if f.endswith(".npz")]
+        if not files:
+            print("No .npz files found in directory.")
+        for f in files:
+            analyze_npz(os.path.join(args.path, f))
+    else:
+        analyze_npz(args.path)
