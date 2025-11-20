@@ -4,6 +4,7 @@ diagnose_data.py
 config.py
 models/
 logs/
+data/
 *.ckpt
 *.h5
 __pycache__/
