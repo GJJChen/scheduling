@@ -66,45 +66,61 @@ def analyze_npz(npz_path):
         elif key == 'X' or arr.ndim > 1:
             # 1. Overall distribution
             plt.figure(figsize=(10, 6))
-            # Sample if too large for plotting
-            if arr.size > 100000:
-                sample_data = np.random.choice(arr.flatten(), 100000, replace=False)
-                sns.histplot(sample_data, bins=100, kde=True)
-                plt.title(f"Overall Value Distribution of {key} (Sampled 100k)")
-            else:
-                sns.histplot(arr.flatten(), bins=100, kde=True)
-                plt.title(f"Overall Value Distribution of {key}")
             
-            plt.xlabel("Value")
-            plt.ylabel("Density/Count")
-            plt.tight_layout()
-            save_path = os.path.join(output_dir, f"{key}_overall_distribution.png")
-            plt.savefig(save_path)
-            plt.close()
-            print(f"Saved {save_path}")
+            flat_arr = arr.flatten()
+            flat_arr = flat_arr[flat_arr != 0]  # Filter out zeros
+            
+            if flat_arr.size == 0:
+                print(f"Skipping overall distribution for {key} - all zeros")
+            else:
+                # Sample if too large for plotting
+                if flat_arr.size > 100000:
+                    sample_data = np.random.choice(flat_arr, 100000, replace=False)
+                    sns.histplot(sample_data, bins=100, kde=True)
+                    plt.title(f"Overall Value Distribution of {key} (Non-zero, Sampled 100k)")
+                else:
+                    sns.histplot(flat_arr, bins=100, kde=True)
+                    plt.title(f"Overall Value Distribution of {key} (Non-zero)")
+                
+                plt.xlabel("Value")
+                plt.ylabel("Density/Count")
+                plt.tight_layout()
+                save_path = os.path.join(output_dir, f"{key}_overall_distribution.png")
+                plt.savefig(save_path)
+                plt.close()
+                print(f"Saved {save_path}")
 
             # 2. If specific shape [N, 128, 3, 2], flatten last two dims to 6 attributes
             if arr.ndim == 4 and arr.shape[2] == 3 and arr.shape[3] == 2:
                 print(f"Detected shape {arr.shape}, plotting separate features for last two dims (3x2=6 attributes)...")
                 
+                service_names = ["VO", "VI", "BE"]
+                attr_names = ["BufferSize", "WaitTime"]
+
                 # Attributes: (0,0), (0,1), (1,0), (1,1), (2,0), (2,1)
                 for i in range(3):
                     for j in range(2):
+                        feat_name = f"{service_names[i]}_{attr_names[j]}"
                         feat_data = arr[:, :, i, j].flatten()
+                        feat_data = feat_data[feat_data != 0]  # Filter out zeros
                         
+                        if feat_data.size == 0:
+                            print(f"Skipping {key} Attribute {feat_name} - all zeros")
+                            continue
+
                         plt.figure(figsize=(10, 6))
                         if feat_data.size > 100000:
                             sample_data = np.random.choice(feat_data, 100000, replace=False)
                             sns.histplot(sample_data, bins=100, kde=True)
-                            plt.title(f"Distribution of {key} Attribute ({i}, {j}) (Sampled 100k)")
+                            plt.title(f"Distribution of {key} {feat_name} (Non-zero, Sampled 100k)")
                         else:
                             sns.histplot(feat_data, bins=100, kde=True)
-                            plt.title(f"Distribution of {key} Attribute ({i}, {j})")
+                            plt.title(f"Distribution of {key} {feat_name} (Non-zero)")
                         
-                        plt.xlabel("Value")
+                        plt.xlabel(feat_name)
                         plt.ylabel("Count")
                         plt.tight_layout()
-                        save_path = os.path.join(output_dir, f"{key}_attr_{i}_{j}_distribution.png")
+                        save_path = os.path.join(output_dir, f"{key}_{feat_name}_distribution.png")
                         plt.savefig(save_path)
                         plt.close()
                         print(f"Saved {save_path}")
