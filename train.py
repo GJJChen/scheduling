@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import argparse, os, json
+import argparse, os, json, csv
 from typing import Optional
 import numpy as np
 import torch
@@ -168,21 +168,22 @@ def train_one_epoch(model, loader, optim, scheduler, device, epoch=None,
 
 @torch.no_grad()
 def evaluate(model, loader, device, epoch=None, amp_enabled=False,
-             non_blocking: bool = False):
+             non_blocking: bool = False, return_details=False):
     model.eval()
     crit = nn.CrossEntropyLoss()
     losses = []
     all_pred, all_tgt = [], []
     all_logits = []
+    all_feats = []
     correct = 0
     total = 0
     pbar = tqdm(loader, desc=f"Val Ep{epoch}" if epoch is not None else "Val", leave=False)
     for feats, label in pbar:
-        feats = feats.to(device, non_blocking=non_blocking)
+        feats_dev = feats.to(device, non_blocking=non_blocking)
         label = label.to(device, non_blocking=non_blocking)
         
         with torch.amp.autocast('cuda', enabled=amp_enabled):
-            logits = model(feats)
+            logits = model(feats_dev)
             loss = crit(logits, label)
             pred = torch.argmax(logits, dim=1)
         
@@ -190,6 +191,8 @@ def evaluate(model, loader, device, epoch=None, amp_enabled=False,
         all_pred.append(pred.detach().cpu().numpy())
         all_tgt.append(label.detach().cpu().numpy())
         all_logits.append(logits.detach().cpu().numpy())
+        if return_details:
+            all_feats.append(feats.numpy())
 
         correct += (pred == label).sum().item()
         total += label.size(0)
@@ -206,13 +209,16 @@ def evaluate(model, loader, device, epoch=None, amp_enabled=False,
     top10_acc = np.mean([all_tgt[i] in top10_preds[i] for i in range(len(all_tgt))])
     
     acc = accuracy_score(all_tgt, all_pred)
+    if return_details:
+        all_feats = np.concatenate(all_feats)
+        return float(np.mean(losses)), float(acc), float(top5_acc), float(top10_acc), all_pred, all_tgt, all_feats
     return float(np.mean(losses)), float(acc), float(top5_acc), float(top10_acc)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="data/train.npz", help="npz 训练数据集路径")
     ap.add_argument("--test-data", type=str, help="npz 测试数据集路径（可选，从不同场景加载测试集）")
-    ap.add_argument("--model", type=str, default="bilstm", choices=["bilstm", "mlp", "transformer", "hier"])
+    ap.add_argument("--model", type=str, default="transformer", choices=["bilstm", "mlp", "transformer", "hier"])
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch-size", type=int, default=256)  # 降低batch size提升稳定性
     ap.add_argument("--lr", type=float, default=1e-4)  # 进一步降低学习率
@@ -439,15 +445,36 @@ def main():
         model.load_state_dict(checkpoint['state_dict'])
         model.eval()
         
-        te_loss, te_acc, te_top5, te_top10 = evaluate(
+        te_loss, te_acc, te_top5, te_top10, te_preds, te_targets, te_feats = evaluate(
             model, test_loader, device, epoch="Test",
-            amp_enabled=bool(args.amp), non_blocking=non_blocking
+            amp_enabled=bool(args.amp), non_blocking=non_blocking, return_details=True
         )
         print(f"测试结果: loss={te_loss:.4f} acc={te_acc:.4f} top5={te_top5:.4f} top10={te_top10:.4f}")
         
         # 将测试结果添加到历史记录
         history.add_test_results(te_loss, te_acc, te_top5, te_top10)
         history.save()
+
+        # 统计错误分布并保存CSV
+        incorrect_mask = te_preds != te_targets
+        incorrect_preds = te_preds[incorrect_mask]
+        incorrect_targets = te_targets[incorrect_mask]
+        incorrect_feats = te_feats[incorrect_mask]
+        
+        error_csv_path = os.path.join(args.results_dir, f"{model_full_name}_errors.csv")
+        with open(error_csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['True_Label', 'Predicted_Label'])
+            for t, p in zip(incorrect_targets, incorrect_preds):
+                writer.writerow([t, p])
+        print(f"错误样本分布已保存到: {error_csv_path}")
+        
+        # 保存错误样本的输入特征
+        error_input_csv_path = os.path.join(args.results_dir, f"{model_full_name}_errors_input.csv")
+        # Flatten: [N, 128, 6] -> [N, 768]
+        incorrect_feats_flat = incorrect_feats.reshape(incorrect_feats.shape[0], -1)
+        np.savetxt(error_input_csv_path, incorrect_feats_flat, delimiter=",", fmt='%.6f')
+        print(f"错误样本输入特征已保存到: {error_input_csv_path}")
 
 if __name__ == "__main__":
     main()
